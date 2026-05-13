@@ -1,0 +1,313 @@
+# Clean A/B Test Pipeline (GitHub Version)
+
+```python
+# =====================================================
+# 1. IMPORTS
+# =====================================================
+
+import numpy as np
+import pandas as pd
+
+from scipy.stats import norm
+from statsmodels.stats.proportion import proportions_ztest
+from statsmodels.stats.proportion import confint_proportions_2indep
+from statsmodels.stats.power import NormalIndPower
+from statsmodels.stats.proportion import proportion_effectsize
+
+import matplotlib.pyplot as plt
+
+
+# =====================================================
+# 2. SAMPLE SIZE CALCULATION
+# =====================================================
+
+alpha = 0.05
+power = 0.80
+margin = 0.002  # 0.2 p.p.
+
+power_analysis = NormalIndPower()
+
+
+def calculate_group_size(baseline_cr, margin, alpha=0.05, power=0.80):
+
+    effect_size = proportion_effectsize(
+        baseline_cr,
+        baseline_cr - margin
+    )
+
+    n = power_analysis.solve_power(
+        effect_size=effect_size,
+        alpha=alpha,
+        power=power,
+        ratio=1,
+        alternative="larger"
+    )
+
+    return int(np.ceil(n))
+
+
+# =====================================================
+# 3. GROUP SIZE CALCULATION
+# =====================================================
+
+experiments = pd.DataFrame([
+    {
+        "experiment": "Exclude clients from SMS",
+        "baseline_cr": 0.010,
+        "margin": 0.002
+    },
+    {
+        "experiment": "Replace SMS with PUSH",
+        "baseline_cr": 0.018,
+        "margin": 0.002
+    }
+])
+
+results = []
+
+for _, row in experiments.iterrows():
+
+    n_group = calculate_group_size(
+        baseline_cr=row["baseline_cr"],
+        margin=row["margin"],
+        alpha=alpha,
+        power=power
+    )
+
+    results.append({
+        "experiment": row["experiment"],
+        "baseline_cr": f"{row['baseline_cr']*100:.1f}%",
+        "non_inferiority_margin": "0.2 p.p.",
+        "test_group": n_group,
+        "control_group": n_group,
+        "total_sample": n_group * 2
+    })
+
+sample_size_df = pd.DataFrame(results)
+
+print("=== REQUIRED SAMPLE SIZE ===")
+display(sample_size_df)
+
+
+# =====================================================
+# 4. SENSITIVITY ANALYSIS
+# =====================================================
+
+sensitivity_results = []
+
+for baseline in [0.008, 0.010, 0.012]:
+
+    n_group = calculate_group_size(
+        baseline_cr=baseline,
+        margin=0.002
+    )
+
+    sensitivity_results.append({
+        "experiment": "Exclude clients from SMS",
+        "baseline_cr": f"{baseline*100:.1f}%",
+        "test_group": n_group,
+        "control_group": n_group,
+        "total_sample": n_group * 2
+    })
+
+for baseline in [0.016, 0.018, 0.020]:
+
+    n_group = calculate_group_size(
+        baseline_cr=baseline,
+        margin=0.002
+    )
+
+    sensitivity_results.append({
+        "experiment": "Replace SMS with PUSH",
+        "baseline_cr": f"{baseline*100:.1f}%",
+        "test_group": n_group,
+        "control_group": n_group,
+        "total_sample": n_group * 2
+    })
+
+
+sensitivity_df = pd.DataFrame(sensitivity_results)
+
+print("=== SENSITIVITY ANALYSIS ===")
+display(sensitivity_df)
+
+
+# =====================================================
+# 5. FINAL A/B TEST RESULTS
+# =====================================================
+
+ab_results = pd.DataFrame([
+    {
+        "experiment": "Exclude clients from SMS",
+        "historical_sms_cr": 0.018,
+        "control_cr": 0.00431,
+        "test_cr": 0.00412,
+        "n_control": 30604,
+        "n_test": 30604
+    },
+    {
+        "experiment": "Replace SMS with PUSH",
+        "historical_sms_cr": 0.018,
+        "control_cr": 0.01821,
+        "test_cr": 0.01761,
+        "n_control": 54642,
+        "n_test": 54642
+    }
+])
+
+
+# =====================================================
+# 6. NON-INFERIORITY TEST
+# =====================================================
+
+margin = 0.002
+alpha = 0.05
+z_90 = norm.ppf(0.95)
+
+stat_results = []
+
+for _, row in ab_results.iterrows():
+
+    control_conv = int(row["control_cr"] * row["n_control"])
+    test_conv = int(row["test_cr"] * row["n_test"])
+
+    diff = row["test_cr"] - row["control_cr"]
+
+    pooled_se = np.sqrt(
+        row["test_cr"] * (1 - row["test_cr"]) / row["n_test"]
+        +
+        row["control_cr"] * (1 - row["control_cr"]) / row["n_control"]
+    )
+
+    ci_low = diff - z_90 * pooled_se
+    ci_high = diff + z_90 * pooled_se
+
+    z_stat = (diff + margin) / pooled_se
+
+    p_value = 1 - norm.cdf(z_stat)
+
+    stat_results.append({
+        "experiment": row["experiment"],
+        "difference_cr": round(diff * 100, 3),
+        "ci_90": (
+            f"[{ci_low*100:.3f}; {ci_high*100:.3f}]"
+        ),
+        "p_value": round(p_value, 4),
+        "non_inferiority_passed": (
+            (ci_low > -margin) and (p_value < alpha)
+        )
+    })
+
+
+stat_df = pd.DataFrame(stat_results)
+
+print("=== NON-INFERIORITY TEST RESULTS ===")
+display(stat_df)
+
+
+# =====================================================
+# 7. BUSINESS EFFECT
+# =====================================================
+
+SMS_COST = 2.45
+POLICY_PRICE = 7000
+BANK_COMMISSION = 0.10
+COMMISSION_PER_POLICY = POLICY_PRICE * BANK_COMMISSION
+
+business_results = []
+
+for _, row in ab_results.iterrows():
+
+    control_sales = int(row["control_cr"] * row["n_control"])
+    test_sales = int(row["test_cr"] * row["n_test"])
+
+    lost_sales = control_sales - test_sales
+
+    if row["experiment"] == "Exclude clients from SMS":
+
+        communication_savings = (
+            row["n_test"] * SMS_COST
+        )
+
+    else:
+
+        communication_savings = (
+            row["n_test"] * SMS_COST
+        )
+
+    lost_commission_income = (
+        lost_sales * COMMISSION_PER_POLICY
+    )
+
+    net_effect = (
+        communication_savings
+        -
+        lost_commission_income
+    )
+
+    business_results.append({
+        "experiment": row["experiment"],
+        "communication_savings": round(communication_savings, 0),
+        "lost_commission_income": round(lost_commission_income, 0),
+        "net_effect": round(net_effect, 0)
+    })
+
+
+business_df = pd.DataFrame(business_results)
+
+print("=== BUSINESS EFFECT ===")
+display(business_df)
+
+
+# =====================================================
+# 8. VISUALIZATION
+# =====================================================
+
+plot_df = ab_results.copy()
+
+plot_df["control_cr_pct"] = plot_df["control_cr"] * 100
+plot_df["test_cr_pct"] = plot_df["test_cr"] * 100
+plot_df["historical_cr_pct"] = plot_df["historical_sms_cr"] * 100
+
+
+for _, row in plot_df.iterrows():
+
+    plt.figure(figsize=(7, 5))
+
+    labels = [
+        "Historical SMS CR",
+        "Control",
+        "Test"
+    ]
+
+    values = [
+        row["historical_cr_pct"],
+        row["control_cr_pct"],
+        row["test_cr_pct"]
+    ]
+
+    plt.bar(labels, values)
+
+    plt.ylabel("Conversion Rate (%)")
+
+    plt.title(row["experiment"])
+
+    plt.grid(axis="y", alpha=0.3)
+
+    plt.show()
+
+
+# =====================================================
+# 9. FINAL SUMMARY
+# =====================================================
+
+final_summary = (
+    ab_results
+    .merge(stat_df, on="experiment")
+    .merge(business_df, on="experiment")
+)
+
+print("=== FINAL SUMMARY ===")
+display(final_summary)
+
+```
