@@ -1,0 +1,643 @@
+# MVP NBA System Pipeline 
+
+
+# =====================================================
+# 1. IMPORTS
+# =====================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
+
+from sklearn.metrics import roc_auc_score, log_loss
+
+from sklift.metrics import (
+    qini_auc_score,
+    uplift_auc_score,
+    uplift_curve,
+    perfect_uplift_curve
+)
+
+
+# =====================================================
+# 2. LOAD DATASET
+# =====================================================
+
+# Example:
+# df = pd.read_csv("nba_osago_dataset.csv")
+
+# Replace path with your dataset path
+
+df = pd.read_csv("nba_osago_dataset.csv")
+
+
+# =====================================================
+# 3. DATA PREPARATION
+# =====================================================
+
+TARGET_COL = "target"
+TREATMENT_COL = "treatment"
+
+forbidden_cols = [
+    TARGET_COL,
+    TREATMENT_COL,
+    "client_id"
+]
+
+feature_cols = [c for c in df.columns if c not in forbidden_cols]
+
+categorical_cols = df[feature_cols].select_dtypes(include=["object", "category"]).columns.tolist()
+numeric_cols = [c for c in feature_cols if c not in categorical_cols]
+
+print("Features:", len(feature_cols))
+
+
+# =====================================================
+# 4. TRAIN / TEST SPLIT
+# =====================================================
+
+train_df, test_df = train_test_split(
+    df,
+    test_size=0.3,
+    random_state=42,
+    stratify=df[[TREATMENT_COL, TARGET_COL]]
+)
+
+print(train_df.shape, test_df.shape)
+
+
+# =====================================================
+# 5. PREPROCESSING
+# =====================================================
+
+numeric_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+categorical_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("encoder", OneHotEncoder(handle_unknown="ignore"))
+])
+
+preprocessor = ColumnTransformer([
+    ("num", numeric_transformer, numeric_cols),
+    ("cat", categorical_transformer, categorical_cols)
+])
+
+
+# =====================================================
+# 6. BASE MODELS
+# =====================================================
+
+base_models = {
+    "Logistic Regression": LogisticRegression(
+        max_iter=2000,
+        class_weight="balanced",
+        random_state=42
+    ),
+
+    "Random Forest": RandomForestClassifier(
+        n_estimators=300,
+        max_depth=8,
+        min_samples_leaf=50,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1
+    ),
+
+    "Gradient Boosting": HistGradientBoostingClassifier(
+        learning_rate=0.05,
+        max_depth=6,
+        max_iter=200,
+        random_state=42
+    )
+}
+
+
+# =====================================================
+# 7. T-LEARNER
+# =====================================================
+
+
+def fit_tlearner(train_df, model):
+
+    learners = {}
+
+    for treatment_name in ["none", "push", "sms"]:
+
+        subset = train_df[
+            train_df[TREATMENT_COL] == treatment_name
+        ].copy()
+
+        pipe = Pipeline([
+            ("prep", preprocessor),
+            ("model", model)
+        ])
+
+        pipe.fit(
+            subset[feature_cols],
+            subset[TARGET_COL]
+        )
+
+        learners[treatment_name] = pipe
+
+    return learners
+
+
+
+def predict_tlearner(learners, data):
+
+    preds = {}
+
+    for treatment_name, model in learners.items():
+
+        preds[treatment_name] = model.predict_proba(
+            data[feature_cols]
+        )[:, 1]
+
+    pred_df = pd.DataFrame(preds)
+
+    pred_df["uplift_push"] = (
+        pred_df["push"] - pred_df["none"]
+    )
+
+    pred_df["uplift_sms"] = (
+        pred_df["sms"] - pred_df["none"]
+    )
+
+    pred_df["best_treatment"] = pred_df[
+        ["none", "push", "sms"]
+    ].idxmax(axis=1)
+
+    return pred_df
+
+
+# =====================================================
+# 8. OUTCOME METRICS
+# =====================================================
+
+
+def evaluate_outcome_models(learners, test_df):
+
+    rows = []
+
+    for treatment_name, model in learners.items():
+
+        subset = test_df[
+            test_df[TREATMENT_COL] == treatment_name
+        ]
+
+        y_true = subset[TARGET_COL]
+
+        y_pred = model.predict_proba(
+            subset[feature_cols]
+        )[:, 1]
+
+        rows.append({
+            "submodel": treatment_name.upper(),
+            "roc_auc": round(roc_auc_score(y_true, y_pred), 4),
+            "logloss": round(log_loss(y_true, y_pred), 4)
+        })
+
+    return pd.DataFrame(rows)
+
+
+# =====================================================
+# 9. QINI / UPLIFT METRICS
+# =====================================================
+
+
+def evaluate_uplift(test_df, pred_df):
+
+    results = {}
+
+    # PUSH vs NONE
+    mask_push = test_df[TREATMENT_COL].isin(["none", "push"])
+
+    y_push = test_df.loc[mask_push, TARGET_COL]
+    t_push = (
+        test_df.loc[mask_push, TREATMENT_COL] == "push"
+    ).astype(int)
+
+    uplift_push = pred_df.loc[mask_push, "uplift_push"]
+
+    results["qini_push_vs_none"] = qini_auc_score(
+        y_push,
+        uplift_push,
+        t_push
+    )
+
+    results["uplift_auc_push_vs_none"] = uplift_auc_score(
+        y_push,
+        uplift_push,
+        t_push
+    )
+
+    # SMS vs NONE
+    mask_sms = test_df[TREATMENT_COL].isin(["none", "sms"])
+
+    y_sms = test_df.loc[mask_sms, TARGET_COL]
+    t_sms = (
+        test_df.loc[mask_sms, TREATMENT_COL] == "sms"
+    ).astype(int)
+
+    uplift_sms = pred_df.loc[mask_sms, "uplift_sms"]
+
+    results["qini_sms_vs_none"] = qini_auc_score(
+        y_sms,
+        uplift_sms,
+        t_sms
+    )
+
+    results["uplift_auc_sms_vs_none"] = uplift_auc_score(
+        y_sms,
+        uplift_sms,
+        t_sms
+    )
+
+    return pd.DataFrame([results]).round(4)
+
+
+# =====================================================
+# 10. QINI CURVES
+# =====================================================
+
+
+def plot_qini_curves(test_df, pred_df, title):
+
+    plt.figure(figsize=(8, 6))
+
+    mask_push = test_df[TREATMENT_COL].isin(["none", "push"])
+
+    y_push = test_df.loc[mask_push, TARGET_COL]
+
+    t_push = (
+        test_df.loc[mask_push, TREATMENT_COL] == "push"
+    ).astype(int)
+
+    uplift_push = pred_df.loc[mask_push, "uplift_push"]
+
+    x, y = uplift_curve(
+        y_push,
+        uplift_push,
+        t_push
+    )
+
+    plt.plot(x, y, label="Push vs None")
+
+    x_perf, y_perf = perfect_uplift_curve(
+        y_push,
+        t_push
+    )
+
+    plt.plot(x_perf, y_perf, linestyle="--", label="Perfect")
+
+    plt.title(title)
+    plt.xlabel("Population")
+    plt.ylabel("Incremental conversions")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.show()
+
+
+# =====================================================
+# 11. TRAIN & EVALUATE T-LEARNER
+# =====================================================
+
+all_t_results = []
+all_t_models = {}
+
+for model_name, model in base_models.items():
+
+    print("=" * 60)
+    print(model_name)
+    print("=" * 60)
+
+    learners = fit_tlearner(train_df, model)
+
+    pred_df = predict_tlearner(
+        learners,
+        test_df
+    )
+
+    outcome_metrics = evaluate_outcome_models(
+        learners,
+        test_df
+    )
+
+    uplift_metrics = evaluate_uplift(
+        test_df,
+        pred_df
+    )
+
+    outcome_metrics.insert(0, "algorithm", model_name)
+    uplift_metrics.insert(0, "algorithm", model_name)
+
+    print("\nOutcome metrics")
+    display(outcome_metrics)
+
+    print("\nUplift metrics")
+    display(uplift_metrics)
+
+    plot_qini_curves(
+        test_df,
+        pred_df,
+        f"Qini Curve — T-Learner — {model_name}"
+    )
+
+    all_t_results.append(uplift_metrics)
+
+    all_t_models[model_name] = {
+        "learners": learners,
+        "pred_df": pred_df
+    }
+
+
+t_results = pd.concat(all_t_results)
+
+print("\nFINAL T-LEARNER COMPARISON")
+display(t_results)
+
+
+# =====================================================
+# 12. BEST T-LEARNER
+# =====================================================
+
+best_t_name = (
+    t_results
+    .sort_values("qini_push_vs_none", ascending=False)
+    .iloc[0]["algorithm"]
+)
+
+print("Best T-learner:", best_t_name)
+
+best_t = all_t_models[best_t_name]
+
+
+# =====================================================
+# 13. X-LEARNER
+# =====================================================
+
+
+def fit_xlearner(train_df, model):
+
+    learners = fit_tlearner(train_df, model)
+
+    pred_train = predict_tlearner(
+        learners,
+        train_df
+    )
+
+    train_copy = train_df.copy()
+
+    train_copy["pseudo_push"] = np.where(
+        train_copy[TREATMENT_COL] == "push",
+        train_copy[TARGET_COL] - pred_train["none"],
+        pred_train["push"] - train_copy[TARGET_COL]
+    )
+
+    train_copy["pseudo_sms"] = np.where(
+        train_copy[TREATMENT_COL] == "sms",
+        train_copy[TARGET_COL] - pred_train["none"],
+        pred_train["sms"] - train_copy[TARGET_COL]
+    )
+
+    push_model = Pipeline([
+        ("prep", preprocessor),
+        ("model", model)
+    ])
+
+    sms_model = Pipeline([
+        ("prep", preprocessor),
+        ("model", model)
+    ])
+
+    push_model.fit(
+        train_copy[feature_cols],
+        train_copy["pseudo_push"]
+    )
+
+    sms_model.fit(
+        train_copy[feature_cols],
+        train_copy["pseudo_sms"]
+    )
+
+    return {
+        "base": learners,
+        "push_model": push_model,
+        "sms_model": sms_model
+    }
+
+
+
+def predict_xlearner(xlearner, data):
+
+    base_preds = predict_tlearner(
+        xlearner["base"],
+        data
+    )
+
+    uplift_push = xlearner[
+        "push_model"
+    ].predict(data[feature_cols])
+
+    uplift_sms = xlearner[
+        "sms_model"
+    ].predict(data[feature_cols])
+
+    result = pd.DataFrame()
+
+    result["none"] = base_preds["none"]
+
+    result["push"] = (
+        result["none"] + uplift_push
+    )
+
+    result["sms"] = (
+        result["none"] + uplift_sms
+    )
+
+    result["uplift_push"] = uplift_push
+    result["uplift_sms"] = uplift_sms
+
+    result["best_treatment"] = result[
+        ["none", "push", "sms"]
+    ].idxmax(axis=1)
+
+    return result
+
+
+# =====================================================
+# 14. TRAIN & EVALUATE X-LEARNER
+# =====================================================
+
+all_x_results = []
+all_x_models = {}
+
+for model_name, model in base_models.items():
+
+    print("=" * 60)
+    print(model_name)
+    print("=" * 60)
+
+    xlearner = fit_xlearner(train_df, model)
+
+    pred_df = predict_xlearner(
+        xlearner,
+        test_df
+    )
+
+    uplift_metrics = evaluate_uplift(
+        test_df,
+        pred_df
+    )
+
+    uplift_metrics.insert(0, "algorithm", model_name)
+
+    print("\nUplift metrics")
+    display(uplift_metrics)
+
+    plot_qini_curves(
+        test_df,
+        pred_df,
+        f"Qini Curve — X-Learner — {model_name}"
+    )
+
+    all_x_results.append(uplift_metrics)
+
+    all_x_models[model_name] = {
+        "model": xlearner,
+        "pred_df": pred_df
+    }
+
+
+x_results = pd.concat(all_x_results)
+
+print("\nFINAL X-LEARNER COMPARISON")
+display(x_results)
+
+
+# =====================================================
+# 15. BEST X-LEARNER
+# =====================================================
+
+best_x_name = (
+    x_results
+    .sort_values("qini_push_vs_none", ascending=False)
+    .iloc[0]["algorithm"]
+)
+
+print("Best X-learner:", best_x_name)
+
+best_x = all_x_models[best_x_name]
+
+
+# =====================================================
+# 16. IPS / SNIPS POLICY EVALUATION
+# =====================================================
+
+
+def evaluate_policy_ips_snips(test_df, pred_df):
+
+    chosen = pred_df["best_treatment"]
+
+    actual = test_df[TREATMENT_COL]
+
+    reward = test_df[TARGET_COL]
+
+    prop = actual.value_counts(normalize=True)
+
+    propensity = actual.map(prop)
+
+    matched = (chosen == actual)
+
+    ips = np.mean(
+        matched * reward / propensity
+    )
+
+    snips = (
+        np.sum(matched * reward / propensity)
+        /
+        np.sum(matched / propensity)
+    )
+
+    return pd.DataFrame([{
+        "ips_estimated_conversion": round(ips, 4),
+        "snips_estimated_conversion": round(snips, 4),
+        "match_rate": round(matched.mean(), 4),
+        "effective_sample": int(matched.sum())
+    }])
+
+
+print("\nOFFLINE POLICY EVALUATION")
+
+ips_results = evaluate_policy_ips_snips(
+    test_df,
+    best_x["pred_df"]
+)
+
+
+display(ips_results)
+
+
+# =====================================================
+# 17. FEATURE IMPORTANCE
+# =====================================================
+
+rf_push_model = best_x["model"]["push_model"]
+
+feature_names = (
+    rf_push_model
+    .named_steps["prep"]
+    .get_feature_names_out()
+)
+
+importances = (
+    rf_push_model
+    .named_steps["model"]
+    .feature_importances_
+)
+
+importance_df = pd.DataFrame({
+    "feature": feature_names,
+    "importance": importances
+})
+
+importance_df = (
+    importance_df
+    .sort_values("importance", ascending=False)
+    .head(20)
+)
+
+print("\nTOP FEATURE IMPORTANCE")
+display(importance_df)
+
+
+plt.figure(figsize=(10, 7))
+
+plt.barh(
+    importance_df["feature"],
+    importance_df["importance"]
+)
+
+plt.title("Top Feature Importance — Best X-Learner")
+plt.xlabel("Importance")
+plt.gca().invert_yaxis()
+plt.grid(alpha=0.3)
+plt.show()
+
+```
